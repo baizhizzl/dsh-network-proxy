@@ -1,0 +1,9 @@
+# Network proxy bundle — one Host row, one Client row.
+#
+# The Host half owns the process-wide outbound dispatcher: it reads the system
+# proxy (or a custom URL), installs it for every `fetch()` caller, and swaps it
+# live. The Client half owns the General Settings preference row and talks to
+# the Host over the bundle's own authenticated `/api/network-proxy` route.
+- insert:
+    - id: network-proxy
+      name: '@local/dsh-network-proxy'

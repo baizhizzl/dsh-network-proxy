@@ -1,0 +1,13 @@
+# Dependencies and build output if someone runs the package locally
+node_modules/
+pnpm-lock.yaml
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and local test output
+*.log
+test/.tmp/

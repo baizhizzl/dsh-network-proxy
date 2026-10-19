@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "HTTP Proxy",
+    "description": "Adds an HTTP proxy row to Settings → General so models, MCP servers, command tools and web fetch use direct, system, or a custom proxy."
+  }
+}

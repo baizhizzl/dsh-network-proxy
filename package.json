@@ -1,0 +1,46 @@
+{
+  "name": "@local/dsh-network-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "HTTP proxy preference in General Settings: direct, follow the Windows/macOS system proxy, or a custom proxy URL, applied to Harness egress immediately without restarting.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/baizhizzl/dsh-network-proxy.git"
+  },
+  "homepage": "https://github.com/baizhizzl/dsh-network-proxy#readme",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "proxy",
+    "http-proxy",
+    "system-proxy"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  }
+}
