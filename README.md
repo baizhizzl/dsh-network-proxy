@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：在 **设置 → 通用设置** 增加一行 *
 
 [![topic: dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-2b7489)](https://github.com/topics/dsh-plugin)
 
+通过 GitHub `dsh-plugin` topic 发布与发现（无市场索引）。
+
 - 包名：`@local/dsh-network-proxy`
 - 平台：Windows（系统代理读取 WinINET）、macOS（`scutil --proxy`）
 - 许可：MIT
@@ -32,17 +34,7 @@ Harness 自带的 `@deepseek-ai/dsh-http-proxy` 只在启动时读一次 `HTTPS_
 
 ## 安装
 
-### 方式一：市场索引（Discover）
-
-1. 打开 **插件 → 发现（Discover）**，添加索引：
-
-   ```
-   https://raw.githubusercontent.com/baizhizzl/dsh-network-proxy/main/market-index.json
-   ```
-
-2. 搜索 `dsh-network-proxy` 并安装。
-
-### 方式二：让 Agent 用插件管理器安装
+### 方式一：让 Agent 用插件管理器安装
 
 在 Harness 会话里说：
 
@@ -54,7 +46,7 @@ Agent 会调用 `plugin_manager` 的 `install_bundle`，参数为：
 git+https://github.com/baizhizzl/dsh-network-proxy.git
 ```
 
-### 方式三：本地目录
+### 方式二：本地目录
 
 ```text
 plugin_manager install_bundle  target: /path/to/dsh-network-proxy
@@ -86,9 +78,8 @@ plugin_manager install_bundle  target: /path/to/dsh-network-proxy
 index.js            Host 半：系统代理检测、dispatcher 安装与恢复、/api/network-proxy 路由
 client.js           Client 半：settings.general.item 中的偏好行（中英文文案、状态展示）
 cordis.patch.yml    插入 network-proxy 插件行
-locale/{zh,en}.json 插件市场上的标题与描述
+locale/{zh,en}.json 插件标题与描述（Plugin Manager 展示）
 icon.svg            插件图标
-market-index.json   插件市场索引（格式 1）
 test/host.test.mjs  Host 半验证脚本
 ```
 
