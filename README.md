@@ -54,8 +54,6 @@ plugin_manager install_bundle  target: /path/to/dsh-network-proxy
 
 安装后打开 **设置 → 通用设置**，在“会话显示”下方即可看到 **HTTP 代理**。
 
-> 修改过 Client 半之后如果页面没有立刻显示，关闭再打开设置（或刷新页面）即可；Host 半与设置值不需要重启。
-
 ## 三种模式
 
 | 模式 | 行为 |
