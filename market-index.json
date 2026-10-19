@@ -1,0 +1,60 @@
+{
+  "format": 1,
+  "title": {
+    "en": "baizhizzl DSH plugins",
+    "zh": "baizhizzl DSH 插件"
+  },
+  "description": {
+    "en": "Plugins for DeepSeek Harness. Add this URL in Plugins > Discover to install them.",
+    "zh": "DeepSeek Harness 插件集合。在 插件 → 发现 中添加此地址即可安装。"
+  },
+  "metadata": {
+    "categories": {
+      "network": {
+        "title": {
+          "en": "Network",
+          "zh": "网络"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "@local/dsh-network-proxy",
+      "title": {
+        "en": "HTTP Proxy",
+        "zh": "HTTP 代理"
+      },
+      "description": {
+        "en": "Adds an HTTP proxy preference to Settings > General: direct, follow the system proxy (Windows WinINET / macOS scutil, PAC included), or a custom proxy URL. Applied to models, MCP, web fetch and command tools immediately, without restarting the Harness.",
+        "zh": "在 设置 → 通用设置 中增加 HTTP 代理选项：直连、跟随系统代理（Windows WinINET / macOS scutil，支持 PAC）或自定义代理。模型、MCP、网页抓取与命令工具立即生效，无需重启 Harness。"
+      },
+      "icon": "icon.svg",
+      "author": "baizhizzl",
+      "homepage": "https://github.com/baizhizzl/dsh-network-proxy#readme",
+      "repository": {
+        "url": "https://github.com/baizhizzl/dsh-network-proxy"
+      },
+      "metadata": {
+        "category": "network",
+        "keywords": [
+          "proxy",
+          "system proxy",
+          "pac",
+          "network"
+        ]
+      },
+      "versions": [
+        {
+          "version": "1.0.0",
+          "publishTimestamp": 1792425558,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/baizhizzl/dsh-network-proxy",
+            "commit": "d3293596958ade5fac9aa42785bbefa5700f6f79"
+          }
+        }
+      ]
+    }
+  ]
+}
