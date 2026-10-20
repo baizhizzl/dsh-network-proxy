@@ -4,7 +4,6 @@ DeepSeek Harness（DSH）插件：在 **设置 → 通用设置** 增加一行 *
 
 [![topic: dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-2b7489)](https://github.com/topics/dsh-plugin)
 
-通过 GitHub `dsh-plugin` topic 发布与发现（无市场索引）。
 
 - 包名：`@local/dsh-network-proxy`
 - 平台：Windows（系统代理读取 WinINET）、macOS（`scutil --proxy`）
