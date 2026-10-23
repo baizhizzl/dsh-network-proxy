@@ -453,6 +453,8 @@ window.__ModuleLoader__.load({
               setCustomFailure(null);
             },
             onKeyDown: (event) => {
+              // Enter that confirms an IME candidate must not submit the field.
+              if (event.nativeEvent?.isComposing || event.nativeEvent?.keyCode === 229) return;
               if (event.key !== 'Enter') return;
               event.preventDefault();
               saveCustom();
