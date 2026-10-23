@@ -29,6 +29,8 @@ const here = dirname(fileURLToPath(import.meta.url))
 process.argv[1] = HOST_ENTRY
 const home = mkdtempSync(join(tmpdir(), 'np-test-'))
 process.env.DSH_HOME = home
+// A launch-time proxy value must survive the plugin's env publication/restore.
+process.env.HTTPS_PROXY = 'http://baseline.invalid:1'
 
 const results = []
 function check(name, passed, detail) {
@@ -138,6 +140,33 @@ try {
   const loopElapsed = Date.now() - loopStarted
   check('PAC evaluation is time-bounded', loopResult.failed === true && loopElapsed < 2000, `${loopElapsed}ms`)
 
+  const escapePac = helpers.createPacEvaluator(
+    'function FindProxyForURL() { return "PROXY " + alert.constructor("return process")().version + ":1" }',
+    'http://127.0.0.1/escape.pac',
+  )
+  const escapeResult = escapePac(new URL('https://example.com/'))
+  check('PAC cannot reach the Host realm', escapeResult.failed === true && escapeResult.proxy === null)
+  const argsEscape = helpers.createPacEvaluator(
+    'function FindProxyForURL() { return "PROXY " + __npArgs.constructor.constructor("return process")().version + ":1" }',
+    'http://127.0.0.1/escape2.pac',
+  )
+  check('PAC cannot reach the Host realm through its arguments', argsEscape(new URL('https://example.com/')).failed === true)
+
+  check('rejects malformed percent credentials', helpers.normalizeCustomProxy('http://a%zz:p@127.0.0.1:7890') === null)
+  const malformedPac = helpers.createPacEvaluator(
+    'function FindProxyForURL() { return "PROXY a%zz:p@127.0.0.1:7890" }',
+    'http://127.0.0.1/malformed.pac',
+  )
+  check('rejects malformed PAC proxy addresses', malformedPac(new URL('https://example.com/')).failed === true)
+
+  const failedPolicy = { kind: 'proxy', http: 'http://static.proxy:1', https: 'http://static.proxy:1', noProxy: '', pac: () => ({ proxy: null, socks: false, failed: true }) }
+  check('PAC failure falls back to the static proxy', helpers.proxyForUrl(new URL('https://example.com/'), failedPolicy) === 'http://static.proxy:1')
+  const failedOnly = { kind: 'proxy', http: null, https: null, noProxy: '', pac: () => ({ proxy: null, socks: false, failed: true }) }
+  check('PAC failure without a fallback goes direct', helpers.proxyForUrl(new URL('https://example.com/'), failedOnly) === null)
+
+  check('bypass matches an IPv6 CIDR', helpers.bypassesProxy('fc00::/7', new URL('http://[fd12:3456::1]/')) === true)
+  check('bypass rejects an IPv6 host outside the CIDR', helpers.bypassesProxy('fd00::/8', new URL('http://[2001:db8::1]/')) === false)
+
   check('preserves credentials in a proxy URL', helpers.toProxyUrl('http://user:pass@127.0.0.1:7890') === 'http://user:pass@127.0.0.1:7890')
   check('defaults a missing proxy port', helpers.toProxyUrl('http://proxy.local') === 'http://proxy.local:80')
 
@@ -199,6 +228,7 @@ try {
 
   await disposeEffect()
   check('unload restores the original dispatcher', undici.getGlobalDispatcher() === launchDispatcher)
+  check('unload restores the launch proxy env', process.env.HTTPS_PROXY === 'http://baseline.invalid:1', String(process.env.HTTPS_PROXY))
   check('route is unregistered on unload', route === null)
 } catch (error) {
   console.error('TEST ERROR', error)
