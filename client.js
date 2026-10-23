@@ -25,12 +25,15 @@ window.__ModuleLoader__.load({
       'custom.placeholder': 'http://127.0.0.1:7890',
       'custom.save': '保存',
       'custom.saving': '保存中…',
+      'custom.unsaved': '尚未保存',
       'status.active': '当前生效：{url}',
       'status.direct': '当前生效：直连',
       'status.reachable': '已连通',
       'status.unreachable': '无法连接',
       'status.pac': 'PAC 自动配置',
       'common.loading': '加载中…',
+      'error.retry': '重试',
+      'error.timeout': 'Host 响应超时，请重试。',
       'error.offline': '无法连接到 Host；请刷新页面后重试。',
       'code.systemDisabled': '系统代理已关闭',
       'code.systemNone': '未检测到系统代理',
@@ -43,6 +46,8 @@ window.__ModuleLoader__.load({
       'code.invalidCustom': '代理地址无效，请使用 http:// 或 https://',
       'code.undiciUnavailable': '当前运行时缺少网络组件，无法切换',
       'code.applyFailed': '切换失败',
+      'code.persistFailed': '设置已生效，但保存失败（重启后会丢失）',
+      'code.bypassAll': '旁路列表为 *，所有流量都直连',
       'code.unknown': '未知状态',
     };
 
@@ -64,12 +69,15 @@ window.__ModuleLoader__.load({
       'custom.placeholder': 'http://127.0.0.1:7890',
       'custom.save': 'Save',
       'custom.saving': 'Saving…',
+      'custom.unsaved': 'Not saved',
       'status.active': 'In effect: {url}',
       'status.direct': 'In effect: direct',
       'status.reachable': 'reachable',
       'status.unreachable': 'unreachable',
       'status.pac': 'via PAC',
       'common.loading': 'Loading…',
+      'error.retry': 'Retry',
+      'error.timeout': 'The Host took too long to respond; try again.',
       'error.offline': 'Cannot reach the Host; reload the page and try again.',
       'code.systemDisabled': 'System proxy is turned off',
       'code.systemNone': 'No system proxy detected',
@@ -82,6 +90,8 @@ window.__ModuleLoader__.load({
       'code.invalidCustom': 'Invalid proxy address; use an http:// or https:// URL with a port',
       'code.undiciUnavailable': 'This runtime lacks the network component needed to switch',
       'code.applyFailed': 'Could not switch',
+      'code.persistFailed': 'Applied, but saving failed; it will be lost after a restart',
+      'code.bypassAll': 'The bypass list is *, so every request connects directly',
       'code.unknown': 'Unknown status',
     };
 
@@ -105,6 +115,9 @@ window.__ModuleLoader__.load({
       'invalid-custom': 'code.invalidCustom',
       'undici-unavailable': 'code.undiciUnavailable',
       'apply-failed': 'code.applyFailed',
+      'persist-failed': 'code.persistFailed',
+      'bypass-all': 'code.bypassAll',
+      'timeout': 'error.timeout',
     };
 
     /** Codes that describe a broken state rather than a mere notice. */
@@ -126,7 +139,7 @@ window.__ModuleLoader__.load({
       try {
         const locale = clientCtx === null ? undefined : clientCtx.get('locale');
         const snapshot = locale && typeof locale.getSnapshot === 'function' ? locale.getSnapshot() : undefined;
-        const id = String((snapshot && (snapshot.id ?? snapshot.locale)) ?? 'en').toLowerCase();
+        const id = String((snapshot && (snapshot.active ?? snapshot.id ?? snapshot.locale)) ?? 'en').toLowerCase();
         return id.startsWith('zh') ? zh : en;
       } catch (error) { return en; }
     }
@@ -221,6 +234,8 @@ window.__ModuleLoader__.load({
     async function hostCall(payload) {
       const base = new URL('.', document.baseURI);
       const url = new URL('api/network-proxy', base);
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = controller === null ? null : window.setTimeout(() => controller.abort(), 15000);
       let response;
       try {
         response = await fetch(url.toString(), {
@@ -228,9 +243,17 @@ window.__ModuleLoader__.load({
           credentials: 'same-origin',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload),
+          ...(controller === null ? {} : { signal: controller.signal }),
         });
       } catch (cause) {
-        throw carry(new Error(cause && cause.message ? cause.message : 'network error'), undefined, true);
+        const aborted = controller !== null && controller.signal.aborted;
+        throw carry(
+          new Error(aborted ? 'request timed out' : (cause && cause.message ? cause.message : 'network error')),
+          aborted ? 'timeout' : undefined,
+          aborted ? false : true,
+        );
+      } finally {
+        if (timer !== null) window.clearTimeout(timer);
       }
       const text = await response.text();
       let data = null;
@@ -304,6 +327,10 @@ window.__ModuleLoader__.load({
         const url = new URL(text);
         if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
         if (url.hostname === '' || url.port === '') return false;
+        // Match the Host: malformed percent escapes would make every proxied
+        // request throw URIError inside undici's ProxyAgent.
+        decodeURIComponent(url.username);
+        decodeURIComponent(url.password);
         return true;
       } catch (error) { return false; }
     }
@@ -321,6 +348,7 @@ window.__ModuleLoader__.load({
       const [customText, setCustomText] = React.useState('');
       const [customFailure, setCustomFailure] = React.useState(null);
       const [pending, setPending] = React.useState(null);
+      const [attempt, setAttempt] = React.useState(0);
 
       /** Adopt one successful response and optionally pin the visible mode. */
       const adopt = (response, pinnedMode) => {
@@ -334,24 +362,33 @@ window.__ModuleLoader__.load({
           failure: null,
         });
         setMode(typeof pinnedMode === 'string' ? pinnedMode : settings.mode);
+        // Re-sync the editable field: an unsaved edit is discarded when the
+        // Host confirms a mode, so the row never shows a value the Host lacks.
+        setCustomText(settings.custom);
+        setCustomFailure(null);
         return settings;
       };
 
       React.useEffect(() => {
         let cancelled = false;
+        setView({ phase: 'loading', settings: null, status: null, detection: null, failure: null });
         hostCall({ action: 'get' }).then((response) => {
           if (cancelled) return;
-          const settings = adopt(response, undefined);
-          setCustomText(settings.custom);
-          setCustomFailure(null);
+          adopt(response, undefined);
         }, (error) => {
           if (cancelled) return;
           setView({ phase: 'error', settings: null, status: null, detection: null, failure: toFailure(error) });
         });
         return () => { cancelled = true; };
-        // The row asks the Host once per mount; later refreshes are user-driven.
+        // One ask per mount or explicit retry; mode changes carry their own response.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-      }, []);
+      }, [attempt]);
+
+      /** Re-run the initial load after a transient failure. */
+      const retry = () => {
+        if (pending !== null) return;
+        setAttempt((value) => value + 1);
+      };
 
       /** Swap the active mode; the Host applies it before the selection moves. */
       const selectMode = (next) => {
@@ -386,7 +423,7 @@ window.__ModuleLoader__.load({
       const detect = () => {
         if (pending !== null) return;
         setPending('detect');
-        hostCall({ action: 'set', mode: 'system' }).then((response) => {
+        hostCall({ action: 'set', mode: 'system', refresh: true }).then((response) => {
           setPending(null);
           adopt(response, 'system');
         }, (error) => {
@@ -427,6 +464,9 @@ window.__ModuleLoader__.load({
         onClick: () => selectMode(entry.id),
       }, translate(entry.key)));
 
+      const savedCustom = view.settings === null ? '' : view.settings.custom;
+      const dirty = mode === 'custom' && String(customText ?? '').trim() !== savedCustom;
+
       let detail = null;
       if (mode === 'system') {
         detail = h('div', { className: 'dnp-detail' },
@@ -466,6 +506,7 @@ window.__ModuleLoader__.load({
             disabled: busy,
             onClick: saveCustom,
           }, translate(pending === 'save' ? 'custom.saving' : 'custom.save')),
+          dirty ? h('span', { className: 'dnp-unsaved' }, translate('custom.unsaved')) : null,
           customFailure === null ? null : h('div', {
             className: 'dnp-inlineError',
             role: 'alert',
@@ -514,7 +555,16 @@ window.__ModuleLoader__.load({
           className: 'dnp-status',
           'data-tone': 'error',
           role: 'alert',
-        }, failureText(view.failure, translate)));
+        },
+        failureText(view.failure, translate),
+        view.phase === 'error'
+          ? h('button', {
+            type: 'button',
+            className: 'dnp-mini dnp-retry',
+            disabled: busy,
+            onClick: retry,
+          }, translate('error.retry'))
+          : null));
       }
 
       return h('div', { className: 'dnp-group' },
@@ -555,6 +605,8 @@ window.__ModuleLoader__.load({
       '.dnp-primary:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-brand-primary) 20%,transparent)}',
       '.dnp-primary:disabled{opacity:.55;cursor:default}',
       '.dnp-inlineError{flex:1 1 100%;color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}',
+      '.dnp-unsaved{flex:none;color:var(--dsw-alias-state-warn-primary);font-size:11px;line-height:16px}',
+      '.dnp-retry{margin-left:8px;height:22px;padding:0 8px}',
       '.dnp-statusGroup{display:flex;flex-direction:column;gap:2px;min-width:0}',
       '.dnp-status{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}',
       '.dnp-status[data-tone=muted]{color:var(--dsw-alias-label-tertiary)}',
