@@ -10,12 +10,21 @@
  * Run:  $env:ELECTRON_RUN_AS_NODE='1'; & 'E:\DeepSeek Harness\DeepSeek Harness.exe' <this file>
  */
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const HOST_ENTRY = 'E:\\DeepSeek Harness\\resources\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\index.js'
+// Electron exposes its resources directory even under ELECTRON_RUN_AS_NODE, so
+// the harness can be found without hardcoding this machine's install path.
+const HOST_ENTRY = process.env.DSH_HOST_ENTRY ?? join(
+  process.resourcesPath ?? 'E:\\DeepSeek Harness\\resources',
+  'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js',
+)
+if (!existsSync(HOST_ENTRY)) {
+  console.error(`Cannot find the Harness Host entry: ${HOST_ENTRY}\nSet DSH_HOST_ENTRY to <Harness>/resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js`)
+  process.exit(1)
+}
 const here = dirname(fileURLToPath(import.meta.url))
 process.argv[1] = HOST_ENTRY
 const home = mkdtempSync(join(tmpdir(), 'np-test-'))
@@ -121,6 +130,31 @@ try {
   check('PAC isInNet branch', pac(new URL('http://10.2.3.4/')).proxy === null)
   check('PAC HTTPS branch', pac(new URL('http://a.corp.test/')).proxy === 'https://proxy.corp.test:8443')
 
+  const failing = helpers.createPacEvaluator('function FindProxyForURL() { throw new Error("boom") }', 'http://127.0.0.1/bad.pac')
+  check('PAC errors are contained', failing(new URL('https://example.com/')).failed === true)
+  const loopStarted = Date.now()
+  const looping = helpers.createPacEvaluator('function FindProxyForURL() { while (true) {} }', 'http://127.0.0.1/loop.pac')
+  const loopResult = looping(new URL('https://example.com/'))
+  const loopElapsed = Date.now() - loopStarted
+  check('PAC evaluation is time-bounded', loopResult.failed === true && loopElapsed < 2000, `${loopElapsed}ms`)
+
+  check('preserves credentials in a proxy URL', helpers.toProxyUrl('http://user:pass@127.0.0.1:7890') === 'http://user:pass@127.0.0.1:7890')
+  check('defaults a missing proxy port', helpers.toProxyUrl('http://proxy.local') === 'http://proxy.local:80')
+
+  const pacOnlyPolicy = helpers.buildPolicy({ mode: 'system', custom: '' }, {
+    enabled: true,
+    http: null,
+    https: null,
+    bypass: '',
+    pacUrl: 'http://127.0.0.1/pac',
+    pacKey: 'k1',
+    pacEvaluator: () => ({ proxy: 'http://127.0.0.1:1', socks: false, failed: false }),
+  })
+  check('PAC-only system policy is proxied', pacOnlyPolicy.kind === 'proxy' && typeof pacOnlyPolicy.pac === 'function')
+  check('identical policies share a fingerprint', helpers.policyFingerprint(pacOnlyPolicy) === helpers.policyFingerprint({ ...pacOnlyPolicy }))
+  check('different proxies get different fingerprints', helpers.policyFingerprint({ kind: 'proxy', http: 'http://a:1', https: 'http://a:1', noProxy: '' }) !== helpers.policyFingerprint({ kind: 'proxy', http: 'http://b:1', https: 'http://b:1', noProxy: '' }))
+  check('system mode without a proxy resolves direct', helpers.buildPolicy({ mode: 'system', custom: '' }, { enabled: false, http: null, https: null, bypass: '' }).kind === 'direct')
+
   const invalid = await call({ action: 'set', mode: 'custom', custom: 'socks5://127.0.0.1:1080' })
   check('rejects a non-http custom proxy', invalid.status === 400 && invalid.body.error.code === 'invalid-custom', invalid.body.error?.code)
 
@@ -129,6 +163,15 @@ try {
   check('status reports the custom proxy', applied.body.status.http === proxyUrl, applied.body.status.http)
   check('dispatcher was swapped', undici.getGlobalDispatcher() !== launchDispatcher)
   check('proxy env is published to children', process.env.HTTPS_PROXY === proxyUrl && process.env.NODE_USE_ENV_PROXY === '1', process.env.HTTPS_PROXY)
+
+  const keptDispatcher = undici.getGlobalDispatcher()
+  const reapplied = await call({ action: 'set', mode: 'custom', custom: proxyUrl })
+  check('re-applying the same policy keeps the dispatcher', reapplied.body.ok === true && undici.getGlobalDispatcher() === keptDispatcher)
+
+  const credentialUrl = `http://user:pass@127.0.0.1:${proxyPort}`
+  const credentialApplied = await call({ action: 'set', mode: 'custom', custom: credentialUrl })
+  check('status hides proxy credentials', credentialApplied.body.status.http === proxyUrl && credentialApplied.body.settings.custom === credentialUrl, credentialApplied.body.status.http)
+  await call({ action: 'set', mode: 'custom', custom: proxyUrl })
 
   const viaProxy = await fetch('http://probe.invalid/through')
   check('http fetch goes through the proxy', (await viaProxy.text()) === 'proxied-ok' && seen.includes('GET http://probe.invalid/through'), seen.join(' | '))
