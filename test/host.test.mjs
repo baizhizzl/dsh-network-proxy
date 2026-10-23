@@ -153,6 +153,9 @@ try {
   check('PAC-only system policy is proxied', pacOnlyPolicy.kind === 'proxy' && typeof pacOnlyPolicy.pac === 'function')
   check('identical policies share a fingerprint', helpers.policyFingerprint(pacOnlyPolicy) === helpers.policyFingerprint({ ...pacOnlyPolicy }))
   check('different proxies get different fingerprints', helpers.policyFingerprint({ kind: 'proxy', http: 'http://a:1', https: 'http://a:1', noProxy: '' }) !== helpers.policyFingerprint({ kind: 'proxy', http: 'http://b:1', https: 'http://b:1', noProxy: '' }))
+  const pacSampleA = helpers.policyFingerprint({ kind: 'proxy', http: 'http://a:1', https: 'http://a:1', noProxy: 'x', pac: () => ({}), pacUrl: 'http://p/pac', pacKey: 'k' })
+  const pacSampleB = helpers.policyFingerprint({ kind: 'proxy', http: 'http://b:2', https: 'http://b:2', noProxy: 'x', pac: () => ({}), pacUrl: 'http://p/pac', pacKey: 'k' })
+  check('PAC fingerprints ignore sampled addresses', pacSampleA === pacSampleB)
   check('system mode without a proxy resolves direct', helpers.buildPolicy({ mode: 'system', custom: '' }, { enabled: false, http: null, https: null, bypass: '' }).kind === 'direct')
 
   const invalid = await call({ action: 'set', mode: 'custom', custom: 'socks5://127.0.0.1:1080' })

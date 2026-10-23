@@ -649,7 +649,7 @@ async function detectSystemProxy(force = false) {
     detection.codes.push('system-none')
   }
   if (detection.enabled && (detection.http !== null || detection.https !== null)) {
-    detection.reachable = await probeTcp(detection.http ?? detection.https)
+    detection.reachable = await probeCached(detection.http ?? detection.https, force)
   }
   detectionCache = detection
   return detection
@@ -685,6 +685,26 @@ function probeTcp(proxyUrl, timeoutMs = 2000) {
       resolve(false)
     }
   })
+}
+
+/** Last reachability probe, reused for a few seconds across detect and apply. */
+let probeCache = null
+
+/**
+ * Probe one proxy endpoint, reusing a recent answer.
+ * @param {string | null} proxyUrl - proxy address.
+ * @param {boolean} force - ignore the cached answer.
+ * @returns {Promise<boolean | null>} reachability, or null without an address.
+ */
+async function probeCached(proxyUrl, force = false) {
+  if (proxyUrl === null || proxyUrl === undefined) return null
+  const now = Date.now()
+  if (!force && probeCache !== null && probeCache.url === proxyUrl && now - probeCache.at < 15_000) {
+    return probeCache.reachable
+  }
+  const reachable = await probeTcp(proxyUrl)
+  probeCache = { url: proxyUrl, reachable, at: now }
+  return reachable
 }
 
 // -------------------------------------------------------------------- routing
@@ -935,8 +955,12 @@ function buildPolicy(preference, detection) {
  */
 function policyFingerprint(policy) {
   if (policy.kind !== 'proxy') return 'direct'
-  const pac = typeof policy.pac === 'function' ? `pac:${policy.pacUrl ?? ''}:${policy.pacKey ?? ''}` : 'static'
-  return `proxy|${pac}|${policy.http ?? ''}|${policy.https ?? ''}|${policy.noProxy ?? ''}`
+  // A PAC route decides per URL; its sampled http/https addresses are display
+  // values and must not make an otherwise identical policy look different.
+  if (typeof policy.pac === 'function') {
+    return `proxy|pac:${policy.pacUrl ?? ''}:${policy.pacKey ?? ''}|${policy.noProxy ?? ''}`
+  }
+  return `proxy|static|${policy.http ?? ''}|${policy.https ?? ''}|${policy.noProxy ?? ''}`
 }
 
 /**
@@ -978,7 +1002,8 @@ async function applySettings(next, options = {}) {
       // policy with no usable address at all is a reachability failure.
       if (typeof policy.pac !== 'function') codes.push('proxy-unreachable')
     } else {
-      reachable = await probeTcp(sample)
+      const detected = sample === detection.http || sample === detection.https
+      reachable = detected && detection.reachable !== null ? detection.reachable : await probeCached(sample)
       if (reachable === false) codes.push('proxy-unreachable')
     }
   }
