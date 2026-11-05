@@ -46,6 +46,13 @@ const PROXY_ENV_NAMES = [
   'NODE_USE_ENV_PROXY',
 ]
 
+/** Variables the launcher resolves for the built-in proxy plugin, in any casing. */
+const LAUNCH_PROXY_NAMES = [
+  'http_proxy', 'HTTP_PROXY',
+  'https_proxy', 'HTTPS_PROXY',
+  'all_proxy', 'ALL_PROXY',
+]
+
 /** Windows WinINET settings key that "use a proxy server" writes to. */
 const WININET_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
 
@@ -148,6 +155,15 @@ function splitHostPort(entry) {
   if (colon !== -1 && entry.indexOf(':', colon + 1) === -1) {
     return { host: entry.slice(0, colon), port: entry.slice(colon + 1) }
   }
+  // A bare IPv6 literal may carry a port (`fd00::1:8080`). Split only when the
+  // tail is a port and the head is a valid IPv6 address; otherwise keep the
+  // whole entry, so `fc00::/7` and `::ffff:1.2.3.4` stay intact.
+  const last = entry.lastIndexOf(':')
+  if (last > colon) {
+    const host = entry.slice(0, last)
+    const port = entry.slice(last + 1)
+    if (/^\d{1,5}$/.test(port) && ipv6Value(host) !== null) return { host, port }
+  }
   return { host: entry }
 }
 
@@ -192,6 +208,15 @@ function ipv6Value(address) {
   const zone = text.indexOf('%')
   if (zone !== -1) text = text.slice(0, zone)
   if (text === '' || !text.includes(':')) return null
+  // An embedded IPv4 tail (`::ffff:1.2.3.4`) counts as two 16-bit groups.
+  const embedded = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text)
+  if (embedded !== null) {
+    const octets = embedded[2].split('.').map(Number)
+    if (octets.some((octet) => octet > 255)) return null
+    const high = ((octets[0] << 8) | octets[1]).toString(16)
+    const low = ((octets[2] << 8) | octets[3]).toString(16)
+    text = `${embedded[1]}${high}:${low}`
+  }
   const halves = text.split('::')
   if (halves.length > 2) return null
   const parse = (part) => (part === '' ? [] : part.split(':'))
@@ -270,6 +295,12 @@ function bypassesProxy(noProxy, url) {
     const candidate = entryHost.replace(/^\*?\./, '').replace(/\.$/, '')
     if (candidate === '') continue
     if (host === candidate || host.endsWith(`.${candidate}`)) return true
+    // The URL parser serializes IPv6 hosts canonically, so a literal entry such
+    // as `::ffff:1.2.3.4` must be compared numerically, not as text.
+    if (candidate.includes(':')) {
+      const wanted = ipv6Value(candidate)
+      if (wanted !== null && ipv6Value(host) === wanted) return true
+    }
   }
   return false
 }
@@ -292,6 +323,25 @@ function withLoopback(noProxy) {
 let detectionCache = null
 
 /**
+ * Parse the value table `reg query` prints for the WinINET key.
+ *
+ * Lines carry four spaces between the name, the type and the data; a value name
+ * may itself contain spaces (`User Agent`).
+ * @param {string} stdout - the command output.
+ * @returns {Map<string, string>} value name → textual value.
+ */
+function parseRegQuery(stdout) {
+  const values = new Map()
+  for (const line of String(stdout).split(/\r?\n/)) {
+    // An empty REG_SZ may print no data column at all, so the last group is optional.
+    const match = /^\s{2,}(\S.*?)\s{4}(REG_[A-Z_]+)(?:\s{4}(.*))?$/.exec(line)
+    if (match === null) continue
+    values.set(match[1].trim(), (match[3] ?? '').trim())
+  }
+  return values
+}
+
+/**
  * Run `reg.exe` and parse its value table.
  * @returns {Promise<Map<string, string>>} value name → textual value.
  */
@@ -302,25 +352,59 @@ function readWininetValues() {
         reject(error)
         return
       }
-      const values = new Map()
-      for (const line of String(stdout).split(/\r?\n/)) {
-        const match = /^\s{2,}(\S.*?)\s{4}(REG_[A-Z_]+)\s{4}(.*)$/.exec(line)
-        if (match === null) continue
-        values.set(match[1].trim(), match[3].trim())
-      }
-      resolve(values)
+      resolve(parseRegQuery(String(stdout)))
     })
   })
 }
 
 /**
- * Read the macOS system proxy through `scutil --proxy`.
+ * Parse the `scutil --proxy` output.
  *
  * The address is reported even while its switch is off, so the row can show a
  * dormant proxy the user can enable. `ExceptionsList` is printed as an array
  * (`ExceptionsList : <array> { 0 : localhost ... }`), which a line-oriented
- * value table cannot read; parse the array body separately.
- * @returns {Promise<{ enabled: boolean, servers: { http: string | null, https: string | null }, bypass: string, pacUrl: string }>} parsed proxy state.
+ * value table cannot read; parse the array body separately. `scutil` prints
+ * IPv6 literals bare, while URL syntax requires brackets.
+ * @param {string} text - the command output.
+ * @returns {{ enabled: boolean, servers: { http: string | null, https: string | null }, bypass: string, pacUrl: string, dormant: string | null }} parsed proxy state.
+ */
+function parseMacProxy(text) {
+  const fields = new Map()
+  for (const line of String(text).split(/\r?\n/)) {
+    const match = /^\s*([A-Za-z]+)\s*:\s*(.*)$/.exec(line)
+    if (match !== null) fields.set(match[1], match[2].trim())
+  }
+  const address = (scheme) => {
+    const host = fields.get(`${scheme}Proxy`) ?? ''
+    const port = fields.get(`${scheme}Port`) ?? ''
+    if (host === '' || port === '') return null
+    const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+    return `http://${authority}:${port}`
+  }
+  // Only a scheme whose switch is on may route traffic; a disabled scheme
+  // keeps its host/port fields populated in `scutil`.
+  const enabledAddress = (scheme) => (fields.get(`${scheme}Enable`) === '1' ? address(scheme) : null)
+  const arrayBody = /ExceptionsList\s*:\s*<array>\s*\{([\s\S]*?)\}/.exec(String(text))?.[1] ?? ''
+  const bypassEntries = arrayBody.split(/\r?\n/)
+    .map((line) => /^\s*\d+\s*:\s*(.+?)\s*$/.exec(line)?.[1])
+    .filter((entry) => typeof entry === 'string' && entry !== '')
+  if (fields.get('ExcludeSimpleHostnames') === '1') bypassEntries.push('<local>')
+  const bypass = bypassEntries.join(';')
+  const pacUrl = fields.get('ProxyAutoConfigEnable') === '1' ? (fields.get('ProxyAutoConfigURLString') ?? '') : ''
+  const http = enabledAddress('HTTP')
+  const https = enabledAddress('HTTPS')
+  return {
+    enabled: http !== null || https !== null || pacUrl !== '',
+    servers: { http, https },
+    bypass,
+    pacUrl,
+    dormant: address('HTTP') ?? address('HTTPS'),
+  }
+}
+
+/**
+ * Read the macOS system proxy through `scutil --proxy`.
+ * @returns {Promise<ReturnType<typeof parseMacProxy>>} parsed proxy state.
  */
 function readMacProxy() {
   return new Promise((resolve, reject) => {
@@ -329,37 +413,7 @@ function readMacProxy() {
         reject(error)
         return
       }
-      const text = String(stdout)
-      const fields = new Map()
-      for (const line of text.split(/\r?\n/)) {
-        const match = /^\s*([A-Za-z]+)\s*:\s*(.*)$/.exec(line)
-        if (match !== null) fields.set(match[1], match[2].trim())
-      }
-      const address = (scheme) => {
-        const host = fields.get(`${scheme}Proxy`) ?? ''
-        const port = fields.get(`${scheme}Port`) ?? ''
-        if (host === '' || port === '') return null
-        return `http://${host}:${port}`
-      }
-      // Only a scheme whose switch is on may route traffic; a disabled scheme
-      // keeps its host/port fields populated in `scutil`.
-      const enabledAddress = (scheme) => (fields.get(`${scheme}Enable`) === '1' ? address(scheme) : null)
-      const arrayBody = /ExceptionsList\s*:\s*<array>\s*\{([\s\S]*?)\}/.exec(text)?.[1] ?? ''
-      const bypassEntries = arrayBody.split(/\r?\n/)
-        .map((line) => /^\s*\d+\s*:\s*(.+?)\s*$/.exec(line)?.[1])
-        .filter((entry) => typeof entry === 'string' && entry !== '')
-      if (fields.get('ExcludeSimpleHostnames') === '1') bypassEntries.push('<local>')
-      const bypass = bypassEntries.join(';')
-      const pacUrl = fields.get('ProxyAutoConfigEnable') === '1' ? (fields.get('ProxyAutoConfigURLString') ?? '') : ''
-      const http = enabledAddress('HTTP')
-      const https = enabledAddress('HTTPS')
-      resolve({
-        enabled: http !== null || https !== null || pacUrl !== '',
-        servers: { http, https },
-        bypass,
-        pacUrl,
-        dormant: address('HTTP') ?? address('HTTPS'),
-      })
+      resolve(parseMacProxy(String(stdout)))
     })
   })
 }
@@ -426,12 +480,55 @@ function toProxyUrl(value) {
   if (text.startsWith('[')) {
     return /^\[[^\]]+\]:\d+$/.test(text) ? `http://${text}` : null
   }
+  if (text.includes('@')) {
+    // WinINET sometimes stores credentials without a scheme (`user:pass@host:port`).
+    const at = text.lastIndexOf('@')
+    const userinfo = text.slice(0, at)
+    const authority = text.slice(at + 1)
+    if (userinfo === '' || !/^(?:\[[^\]]+\]|[^:/\s]+):\d+$/.test(authority)) return null
+    try {
+      const url = new URL(`http://${text}`)
+      if (url.username === '' || !hasValidCredentials(url)) return null
+      const auth = url.password === '' ? `${url.username}@` : `${url.username}:${url.password}@`
+      return `http://${auth}${authority}`
+    } catch { return null }
+  }
   const colon = text.indexOf(':')
   if (colon !== -1 && text.indexOf(':', colon + 1) !== -1) {
     // Bare IPv6 literal without a port is not a proxy address.
     return null
   }
   return /^[^:/\s]+:\d+$/.test(text) ? `http://${text}` : null
+}
+
+/**
+ * The authority of a URL exactly as it was written, without userinfo.
+ * @param {string} text - the raw URL text.
+ * @returns {string} the authority, or an empty string.
+ */
+function rawAuthority(text) {
+  const start = text.indexOf('//')
+  const rest = start === -1 ? text : text.slice(start + 2)
+  const end = rest.search(/[/?#]/)
+  const authority = end === -1 ? rest : rest.slice(0, end)
+  const at = authority.lastIndexOf('@')
+  return at === -1 ? authority : authority.slice(at + 1)
+}
+
+/**
+ * The port the text writes, even when it is the scheme's default.
+ *
+ * WHATWG parsing empties `.port` for `http://host:80`, so a typed default port
+ * is otherwise indistinguishable from no port at all — and `http://host` with
+ * no port must stay invalid.
+ * @param {string} text - the raw URL text.
+ * @returns {string | null} the port digits, or null when the authority has none.
+ */
+function explicitPort(text) {
+  const match = /^(?:\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(rawAuthority(text))
+  if (match === null) return null
+  const port = Number(match[1])
+  return port >= 1 && port <= 65535 ? String(port) : null
 }
 
 /**
@@ -446,14 +543,18 @@ function normalizeCustomProxy(value) {
   try {
     const url = new URL(text)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
-    if (url.hostname === '' || url.port === '') return null
+    if (url.hostname === '') return null
+    // `url.port` is empty for the scheme's default port, so recover the digits
+    // from the text: `http://host:80` is a valid preference, `http://host` is not.
+    const port = url.port !== '' ? url.port : explicitPort(text)
+    if (port === null) return null
     if (!hasValidCredentials(url)) return null
     // `url.username`/`url.password` are already percent-encoded; re-encoding
     // them would double-encode a correctly written credential.
     const credentials = url.username === ''
       ? ''
       : `${url.username}${url.password === '' ? '' : `:${url.password}`}@`
-    return `${url.protocol}//${credentials}${url.host}`
+    return `${url.protocol}//${credentials}${url.hostname}:${port}`
   } catch { return null }
 }
 
@@ -505,6 +606,13 @@ function stripUserInfo(value) {
 }
 
 /**
+ * Upper bound on a PAC script. Compiling is synchronous and cannot be
+ * interrupted, but a statement-dense 1 MiB script compiles in tens of
+ * milliseconds, so this cap keeps the worst case short.
+ */
+const MAX_PAC_BYTES = 1024 * 1024
+
+/**
  * Download a PAC script with redirects, bounded by a timeout.
  * @param {string} url - PAC URL.
  * @returns {Promise<string>} the script text.
@@ -535,7 +643,7 @@ function downloadText(url, redirects = 0) {
       let size = 0
       response.on('data', (chunk) => {
         size += chunk.length
-        if (size > 2 * 1024 * 1024) {
+        if (size > MAX_PAC_BYTES) {
           request.destroy(new Error('PAC script too large'))
           return
         }
@@ -633,6 +741,7 @@ function proxyTokenUrl(scheme, authority) {
  * @returns {(url: URL) => { proxy: string | null, socks: boolean, failed: boolean }} the evaluator.
  */
 function createPacEvaluator(script, pacUrl) {
+  if (Buffer.byteLength(String(script), 'utf8') > MAX_PAC_BYTES) throw new Error('PAC script too large')
   const options = { codeGeneration: { strings: false, wasm: false }, name: 'pac' }
   const context = typeof vm.constants?.DONT_CONTEXTIFY === 'symbol'
     ? vm.createContext(vm.constants.DONT_CONTEXTIFY, options)
@@ -942,7 +1051,7 @@ function createDispatcher(policy, undici) {
         return new undici.ProxyAgent({ ...options, uri: proxy })
       } catch (error) {
         // A malformed proxy URI must not break every request in the process.
-        pacFailureAt = Date.now()
+        // This is not a PAC failure; the reachability probe reports it.
         log('cannot create a ProxyAgent for the selected proxy', error)
         return new undici.Pool(origin, options)
       }
@@ -969,6 +1078,21 @@ function writeProxyEnv(values) {
     if (value === undefined) Reflect.deleteProperty(process.env, name)
     else process.env[name] = value
   }
+}
+
+/**
+ * Whether the launcher published a proxy before this plugin touched anything.
+ *
+ * `envBaseline` is the state the plugin first saw, so this stays true even
+ * after the plugin has installed its own policy.
+ * @returns {boolean} true when at least one proxy variable carries a value.
+ */
+function hasLaunchProxy() {
+  if (envBaseline === null) envBaseline = snapshotProxyEnv()
+  return LAUNCH_PROXY_NAMES.some((name) => {
+    const value = envBaseline[name]
+    return typeof value === 'string' && value.trim() !== ''
+  })
 }
 
 /**
@@ -1011,7 +1135,22 @@ let installedKey = null
  */
 async function installPolicy(policy) {
   const key = policyFingerprint(policy)
-  if (current !== null && installedKey === key) return
+  if (installedKey === key) return
+  if (policy.kind === 'inherit') {
+    // Hand the process back to whatever ran before this plugin: its dispatcher
+    // when this plugin already swapped one, and the launch environment always.
+    const previous = current
+    current = null
+    installedKey = key
+    if (baseline !== null) {
+      try { baseline.undici.setGlobalDispatcher(baseline.dispatcher) } catch (error) { log('cannot restore the launch dispatcher', error) }
+    }
+    if (envBaseline !== null) writeProxyEnv(envBaseline)
+    if (previous !== null) {
+      void previous.dispatcher.close().catch(() => {})
+    }
+    return
+  }
   const undici = await loadUndici()
   const dispatcher = createDispatcher(policy, undici)
   const previous = current
@@ -1039,6 +1178,12 @@ async function restorePolicy() {
     writeProxyEnv(envBaseline)
     envBaseline = null
   }
+  // A reload must not reuse a PAC script, a probe answer, or a detection that
+  // belongs to the previous lifetime of the plugin.
+  detectionCache = null
+  probeCache = null
+  pacCache = null
+  pacFailureAt = 0
   if (owned !== null) {
     // Drain in-flight requests without delaying an unload past their lifetime.
     void owned.dispatcher.close().catch(() => {})
@@ -1082,33 +1227,40 @@ function enqueue(operation) {
  * Build the policy one preference selects.
  * @param {{ mode: string, custom: string }} preference - the saved preference.
  * @param {object} detection - the latest system detection.
+ * @param {boolean} [fallbackToLaunch] - keep the launcher's proxy when the OS has none.
  * @returns {object} the policy.
  */
-function buildPolicy(preference, detection) {
+function buildPolicy(preference, detection, fallbackToLaunch = false) {
   if (preference.mode === 'custom') {
     const url = normalizeCustomProxy(preference.custom)
     if (url === null) throw codedError('invalid-custom', 'The custom proxy must be an http:// or https:// URL with a port')
     return { kind: 'proxy', http: url, https: url, noProxy: withLoopback(''), source: 'custom' }
   }
-  if (preference.mode === 'system' && detection.enabled) {
-    const noProxy = withLoopback(detection.bypass)
-    if (typeof detection.pacEvaluator === 'function') {
-      // A PAC route decides per URL, even when the sample also produced a
-      // static address for the status line.
-      return {
-        kind: 'proxy',
-        http: detection.http ?? null,
-        https: detection.https ?? null,
-        noProxy,
-        pac: detection.pacEvaluator,
-        pacKey: detection.pacKey,
-        pacUrl: detection.pacUrl,
-        source: 'system',
+  if (preference.mode === 'system') {
+    if (detection.enabled) {
+      const noProxy = withLoopback(detection.bypass)
+      if (typeof detection.pacEvaluator === 'function') {
+        // A PAC route decides per URL, even when the sample also produced a
+        // static address for the status line.
+        return {
+          kind: 'proxy',
+          http: detection.http ?? null,
+          https: detection.https ?? null,
+          noProxy,
+          pac: detection.pacEvaluator,
+          pacKey: detection.pacKey,
+          pacUrl: detection.pacUrl,
+          source: 'system',
+        }
+      }
+      if (detection.http !== null || detection.https !== null) {
+        return { kind: 'proxy', http: detection.http, https: detection.https, noProxy, source: 'system' }
       }
     }
-    if (detection.http !== null || detection.https !== null) {
-      return { kind: 'proxy', http: detection.http, https: detection.https, noProxy, source: 'system' }
-    }
+    // The OS names no usable proxy. Rather than forcing every request direct —
+    // which would discard a policy the launcher resolved from the environment —
+    // system mode inherits whatever dispatcher was installed before this plugin.
+    if (fallbackToLaunch) return { kind: 'inherit', noProxy: '' }
   }
   return { kind: 'direct', noProxy: '' }
 }
@@ -1120,6 +1272,7 @@ function buildPolicy(preference, detection) {
  * @returns {string} a stable key.
  */
 function policyFingerprint(policy) {
+  if (policy.kind === 'inherit') return 'inherit'
   if (policy.kind !== 'proxy') return 'direct'
   // A PAC route decides per URL; its sampled http/https addresses are display
   // values and must not make an otherwise identical policy look different.
@@ -1160,7 +1313,7 @@ async function applySettings(next, options = {}) {
   const detection = next.mode === 'system'
     ? await detectSystemProxy(forceDetect, options.forcePac === true)
     : detectionCache
-  const policy = buildPolicy(next, detection ?? { enabled: false })
+  const policy = buildPolicy(next, detection ?? { enabled: false }, next.mode === 'system' && hasLaunchProxy())
   const codes = next.mode === 'system' ? [...(detection?.codes ?? [])] : []
   let reachable = null
 
@@ -1182,9 +1335,10 @@ async function applySettings(next, options = {}) {
   }
 
   settings = next
+  const active = policy.kind === 'proxy' && !bypassAll
   status = {
-    active: policy.kind === 'proxy' && !bypassAll,
-    source: policy.kind === 'proxy' && !bypassAll ? policy.source : 'direct',
+    active,
+    source: active ? policy.source : policy.kind === 'inherit' ? 'launch' : 'direct',
     http: sanitizeProxy(policy.http ?? null),
     https: sanitizeProxy(policy.https ?? null),
     sample: sanitizeProxy(sample),
@@ -1231,7 +1385,7 @@ async function whenReady() {
   if (bootstrapPromise === null) return
   await Promise.race([
     bootstrapPromise.catch(() => {}),
-    new Promise((resolve) => setTimeout(resolve, 12_000)),
+    new Promise((resolve) => setTimeout(resolve, 8_000)),
   ])
 }
 
@@ -1267,9 +1421,11 @@ function publicDetection(detection) {
  */
 function snapshot(detection) {
   const codes = new Set(status.codes)
-  if (pacFailureAt !== 0 && Date.now() - pacFailureAt < 60_000) codes.add('pac-failed')
-  const current = codes.size === status.codes.length ? status : { ...status, codes: [...codes] }
-  return { ok: true, settings, status: current, detection: publicDetection(detection) }
+  // A PAC failure is only meaningful while a PAC route is the active policy;
+  // it must not linger on the row after the user switches to direct/custom.
+  if (status.pac && pacFailureAt !== 0 && Date.now() - pacFailureAt < 60_000) codes.add('pac-failed')
+  const effective = codes.size === status.codes.length ? status : { ...status, codes: [...codes] }
+  return { ok: true, settings, status: effective, detection: publicDetection(detection) }
 }
 
 /**
@@ -1285,8 +1441,72 @@ function json(payload, statusCode = 200) {
   })
 }
 
+/** Budget for one Client action, below the Client's own 15 s abort. */
+const ACTION_DEADLINE_MS = 12_000
+
+/** Sentinel the deadline race resolves with when the action runs long. */
+const ACTION_TIMEOUT = Symbol('network-proxy timeout')
+
+/**
+ * Race one operation against the action budget.
+ * @param {Promise<unknown>} operation - the work.
+ * @returns {Promise<unknown | typeof ACTION_TIMEOUT>} the result or the sentinel.
+ */
+async function withDeadline(operation) {
+  let timer = null
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(ACTION_TIMEOUT), ACTION_DEADLINE_MS)
+    timer.unref?.()
+  })
+  try {
+    return await Promise.race([operation, timeout])
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+}
+
+/**
+ * Run one action, resolving to its response.
+ * @param {string} action - the requested action.
+ * @param {Record<string, unknown>} payload - the request body.
+ * @returns {Promise<Response>} the response.
+ */
+async function runAction(action, payload) {
+  await whenReady()
+  if (action === 'get') {
+    const detection = await detectSystemProxy(false)
+    return json(snapshot(detection))
+  }
+  if (action === 'detect') {
+    const detection = await detectSystemProxy(true, true)
+    return json(snapshot(detection))
+  }
+  if (action === 'set') {
+    const mode = payload.mode
+    if (typeof mode !== 'string' || !MODES.has(mode)) {
+      return json({ ok: false, error: { code: 'invalid-mode', message: `Unknown mode ${String(mode)}` } }, 400)
+    }
+    const custom = mode === 'custom'
+      ? String(typeof payload.custom === 'string' ? payload.custom : settings.custom).trim()
+      : String(settings.custom ?? '')
+    if (mode === 'custom' && normalizeCustomProxy(custom) === null) {
+      return json({ ok: false, error: { code: 'invalid-custom', message: 'The custom proxy must be an http:// or https:// URL with a port' } }, 400)
+    }
+    const forceDetect = mode === 'system'
+    const forcePac = forceDetect && payload.refresh === true
+    await enqueue(() => applySettings({ mode, custom }, { persist: true, forceDetect, forcePac }))
+    return json(snapshot(detectionCache))
+  }
+  return json({ ok: false, error: { code: 'bad-request', message: `Unknown action ${String(action)}` } }, 400)
+}
+
 /**
  * Handle one authenticated Client request.
+ *
+ * The whole action runs under a budget below the Client's own abort, so a slow
+ * registry read or PAC download answers with `timeout` instead of a dropped
+ * connection. The queued apply keeps running and its result shows on the next
+ * request.
  * @param {Request} request - the posted request.
  * @returns {Promise<Response>} the result.
  */
@@ -1300,32 +1520,15 @@ async function handleRequest(request) {
   const action = payload !== null && typeof payload === 'object' ? payload.action : undefined
 
   try {
-    await whenReady()
-    if (action === 'get') {
-      const detection = await detectSystemProxy(false)
-      return json(snapshot(detection))
+    const result = await withDeadline(runAction(action, payload !== null && typeof payload === 'object' ? payload : {}))
+    if (result === ACTION_TIMEOUT) {
+      log(`action ${String(action)} exceeded ${ACTION_DEADLINE_MS}ms`)
+      return json({
+        ok: false,
+        error: { code: 'timeout', message: 'The Host took too long to answer; the operation may still finish.' },
+      }, 504)
     }
-    if (action === 'detect') {
-      const detection = await detectSystemProxy(true, true)
-      return json(snapshot(detection))
-    }
-    if (action === 'set') {
-      const mode = payload.mode
-      if (typeof mode !== 'string' || !MODES.has(mode)) {
-        return json({ ok: false, error: { code: 'invalid-mode', message: `Unknown mode ${String(mode)}` } }, 400)
-      }
-      const custom = mode === 'custom'
-        ? String(typeof payload.custom === 'string' ? payload.custom : settings.custom).trim()
-        : String(settings.custom ?? '')
-      if (mode === 'custom' && normalizeCustomProxy(custom) === null) {
-        return json({ ok: false, error: { code: 'invalid-custom', message: 'The custom proxy must be an http:// or https:// URL with a port' } }, 400)
-      }
-      const forceDetect = mode === 'system'
-      const forcePac = forceDetect && payload.refresh === true
-      await enqueue(() => applySettings({ mode, custom }, { persist: true, forceDetect, forcePac }))
-      return json(snapshot(detectionCache))
-    }
-    return json({ ok: false, error: { code: 'bad-request', message: `Unknown action ${String(action)}` } }, 400)
+    return result
   } catch (error) {
     const code = typeof error?.code === 'string' ? error.code : 'apply-failed'
     log(`action ${String(action)} failed`, error)
@@ -1367,9 +1570,14 @@ export const __test = {
   bypassesProxy,
   buildPolicy,
   createPacEvaluator,
+  explicitPort,
+  installPolicy,
   normalizeCustomProxy,
+  parseMacProxy,
   parseProxyServer,
+  parseRegQuery,
   policyFingerprint,
   proxyForUrl,
+  sanitizeProxy,
   toProxyUrl,
 }

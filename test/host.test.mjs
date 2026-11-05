@@ -190,6 +190,11 @@ try {
   const invalid = await call({ action: 'set', mode: 'custom', custom: 'socks5://127.0.0.1:1080' })
   check('rejects a non-http custom proxy', invalid.status === 400 && invalid.body.error.code === 'invalid-custom', invalid.body.error?.code)
 
+  // A written default port must survive WHATWG parsing (which empties `.port`).
+  const defaultPort = await call({ action: 'set', mode: 'custom', custom: 'http://127.0.0.1:80' })
+  check('accepts a custom proxy on the default port', defaultPort.status === 200 && defaultPort.body.ok === true && defaultPort.body.settings.custom === 'http://127.0.0.1:80', defaultPort.body.error?.code)
+  await call({ action: 'set', mode: 'custom', custom: proxyUrl })
+
   const applied = await call({ action: 'set', mode: 'custom', custom: proxyUrl })
   check('custom mode applies', applied.body.ok === true && applied.body.status.active === true, applied.body.status?.source)
   check('status reports the custom proxy', applied.body.status.http === proxyUrl, applied.body.status.http)
@@ -199,6 +204,14 @@ try {
   const keptDispatcher = undici.getGlobalDispatcher()
   const reapplied = await call({ action: 'set', mode: 'custom', custom: proxyUrl })
   check('re-applying the same policy keeps the dispatcher', reapplied.body.ok === true && undici.getGlobalDispatcher() === keptDispatcher)
+
+  // System mode with no usable OS proxy hands the process back to the launcher
+  // instead of forcing every request direct.
+  await helpers.installPolicy({ kind: 'inherit', noProxy: '' })
+  check('inherit restores the launch dispatcher', undici.getGlobalDispatcher() === launchDispatcher)
+  check('inherit restores the launch proxy env', process.env.HTTPS_PROXY === 'http://baseline.invalid:1', String(process.env.HTTPS_PROXY))
+  const afterInherit = await call({ action: 'set', mode: 'custom', custom: proxyUrl })
+  check('a policy after inherit swaps the dispatcher again', afterInherit.body.ok === true && undici.getGlobalDispatcher() !== launchDispatcher)
 
   const credentialUrl = `http://user:pass@127.0.0.1:${proxyPort}`
   const credentialApplied = await call({ action: 'set', mode: 'custom', custom: credentialUrl })

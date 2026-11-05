@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
       'custom.unsaved': '尚未保存',
       'status.active': '当前生效：{url}',
       'status.direct': '当前生效：直连',
+      'status.launch': '当前生效：启动时的代理策略（来自环境变量）',
       'status.reachable': '已连通',
       'status.unreachable': '无法连接',
       'status.pac': 'PAC 自动配置',
@@ -72,6 +73,7 @@ window.__ModuleLoader__.load({
       'custom.unsaved': 'Not saved',
       'status.active': 'In effect: {url}',
       'status.direct': 'In effect: direct',
+      'status.launch': 'In effect: the launch-time proxy policy (from environment variables)',
       'status.reachable': 'reachable',
       'status.unreachable': 'unreachable',
       'status.pac': 'via PAC',
@@ -206,6 +208,7 @@ window.__ModuleLoader__.load({
         : (record !== null && record.reachable === false ? false : null);
       return {
         active,
+        source: asText(record === null ? null : record.source),
         url: active ? (sample ?? http ?? https) : null,
         reachable,
         pac: record !== null && record.pac === true,
@@ -318,6 +321,24 @@ window.__ModuleLoader__.load({
       return translate('system.none');
     }
 
+    /** The authority of a URL as written, without userinfo. */
+    function rawAuthority(text) {
+      const start = text.indexOf('//');
+      const rest = start === -1 ? text : text.slice(start + 2);
+      const end = rest.search(/[/?#]/);
+      const authority = end === -1 ? rest : rest.slice(0, end);
+      const at = authority.lastIndexOf('@');
+      return at === -1 ? authority : authority.slice(at + 1);
+    }
+
+    /** The port the text writes, even when it is the scheme's default. */
+    function explicitPort(text) {
+      const match = /^(?:\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(rawAuthority(text));
+      if (match === null) return null;
+      const port = Number(match[1]);
+      return port >= 1 && port <= 65535 ? String(port) : null;
+    }
+
     /** Validate a typed proxy URL the same way the Host does. */
     function isProxyUrl(value) {
       const text = String(value ?? '').trim();
@@ -326,7 +347,10 @@ window.__ModuleLoader__.load({
       try {
         const url = new URL(text);
         if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-        if (url.hostname === '' || url.port === '') return false;
+        if (url.hostname === '') return false;
+        // `url.port` is empty for the scheme's default port, so recover the
+        // digits from the text; a port must still be written explicitly.
+        if (url.port === '' && explicitPort(text) === null) return false;
         // Match the Host: malformed percent escapes would make every proxied
         // request throw URIError inside undici's ProxyAgent.
         decodeURIComponent(url.username);
@@ -523,9 +547,15 @@ window.__ModuleLoader__.load({
       } else if (view.status !== null) {
         const summary = summarizeStatus(view.status);
         const pacOnly = summary.active && summary.pac && summary.url === null;
-        const parts = [summary.url === null
-          ? (pacOnly ? translate('status.active', { url: translate('status.pac') }) : translate('status.direct'))
-          : translate('status.active', { url: summary.url })];
+        let headline;
+        if (summary.source === 'launch') {
+          headline = translate('status.launch');
+        } else if (summary.url === null) {
+          headline = pacOnly ? translate('status.active', { url: translate('status.pac') }) : translate('status.direct');
+        } else {
+          headline = translate('status.active', { url: summary.url });
+        }
+        const parts = [headline];
         if (summary.url !== null && summary.pac) parts.push(translate('status.pac'));
         let tone = 'normal';
         if (summary.url !== null && summary.reachable === false) {
@@ -633,17 +663,30 @@ window.__ModuleLoader__.load({
         return () => { tag.remove(); };
       }, 'network-proxy: styles');
 
-      ctx.slots.inject('settings.general.item', () => ctx.slots.register({
+      ctx.effect(() => ctx.slots.inject('settings.general.item', () => ctx.slots.register({
         name: 'settings.general.item',
         id: 'network-proxy',
         order: 13,
         locale: NS,
-      }, NetworkProxyRow));
+      }, NetworkProxyRow)), 'network-proxy: settings row');
     }
 
     return {
       inject: ['slots', 'locale'],
       apply,
+      // Pure helpers for `test/client.test.mjs`; the ModuleLoader ignores extra exports.
+      __test: {
+        codeKeys: CODE_KEYS,
+        codeText,
+        dictionaries: { zh, en },
+        explicitPort,
+        failureText,
+        fill,
+        isProxyUrl,
+        normalizeSettings,
+        summarizeStatus,
+        systemText,
+      },
     };
   },
 });
