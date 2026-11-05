@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
       'custom.unsaved': '尚未保存',
       'status.active': '当前生效：{url}',
       'status.direct': '当前生效：直连',
+      'status.launch': '当前生效：启动时的代理策略（来自环境变量）',
       'status.reachable': '已连通',
       'status.unreachable': '无法连接',
       'status.pac': 'PAC 自动配置',
@@ -72,6 +73,7 @@ window.__ModuleLoader__.load({
       'custom.unsaved': 'Not saved',
       'status.active': 'In effect: {url}',
       'status.direct': 'In effect: direct',
+      'status.launch': 'In effect: the launch-time proxy policy (from environment variables)',
       'status.reachable': 'reachable',
       'status.unreachable': 'unreachable',
       'status.pac': 'via PAC',
@@ -206,6 +208,7 @@ window.__ModuleLoader__.load({
         : (record !== null && record.reachable === false ? false : null);
       return {
         active,
+        source: asText(record === null ? null : record.source),
         url: active ? (sample ?? http ?? https) : null,
         reachable,
         pac: record !== null && record.pac === true,
@@ -544,9 +547,15 @@ window.__ModuleLoader__.load({
       } else if (view.status !== null) {
         const summary = summarizeStatus(view.status);
         const pacOnly = summary.active && summary.pac && summary.url === null;
-        const parts = [summary.url === null
-          ? (pacOnly ? translate('status.active', { url: translate('status.pac') }) : translate('status.direct'))
-          : translate('status.active', { url: summary.url })];
+        let headline;
+        if (summary.source === 'launch') {
+          headline = translate('status.launch');
+        } else if (summary.url === null) {
+          headline = pacOnly ? translate('status.active', { url: translate('status.pac') }) : translate('status.direct');
+        } else {
+          headline = translate('status.active', { url: summary.url });
+        }
+        const parts = [headline];
         if (summary.url !== null && summary.pac) parts.push(translate('status.pac'));
         let tone = 'normal';
         if (summary.url !== null && summary.reachable === false) {
@@ -665,6 +674,19 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       apply,
+      // Pure helpers for `test/client.test.mjs`; the ModuleLoader ignores extra exports.
+      __test: {
+        codeKeys: CODE_KEYS,
+        codeText,
+        dictionaries: { zh, en },
+        explicitPort,
+        failureText,
+        fill,
+        isProxyUrl,
+        normalizeSettings,
+        summarizeStatus,
+        systemText,
+      },
     };
   },
 });
