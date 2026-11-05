@@ -292,6 +292,25 @@ function withLoopback(noProxy) {
 let detectionCache = null
 
 /**
+ * Parse the value table `reg query` prints for the WinINET key.
+ *
+ * Lines carry four spaces between the name, the type and the data; a value name
+ * may itself contain spaces (`User Agent`).
+ * @param {string} stdout - the command output.
+ * @returns {Map<string, string>} value name → textual value.
+ */
+function parseRegQuery(stdout) {
+  const values = new Map()
+  for (const line of String(stdout).split(/\r?\n/)) {
+    // An empty REG_SZ may print no data column at all, so the last group is optional.
+    const match = /^\s{2,}(\S.*?)\s{4}(REG_[A-Z_]+)(?:\s{4}(.*))?$/.exec(line)
+    if (match === null) continue
+    values.set(match[1].trim(), (match[3] ?? '').trim())
+  }
+  return values
+}
+
+/**
  * Run `reg.exe` and parse its value table.
  * @returns {Promise<Map<string, string>>} value name → textual value.
  */
@@ -302,25 +321,59 @@ function readWininetValues() {
         reject(error)
         return
       }
-      const values = new Map()
-      for (const line of String(stdout).split(/\r?\n/)) {
-        const match = /^\s{2,}(\S.*?)\s{4}(REG_[A-Z_]+)\s{4}(.*)$/.exec(line)
-        if (match === null) continue
-        values.set(match[1].trim(), match[3].trim())
-      }
-      resolve(values)
+      resolve(parseRegQuery(String(stdout)))
     })
   })
 }
 
 /**
- * Read the macOS system proxy through `scutil --proxy`.
+ * Parse the `scutil --proxy` output.
  *
  * The address is reported even while its switch is off, so the row can show a
  * dormant proxy the user can enable. `ExceptionsList` is printed as an array
  * (`ExceptionsList : <array> { 0 : localhost ... }`), which a line-oriented
- * value table cannot read; parse the array body separately.
- * @returns {Promise<{ enabled: boolean, servers: { http: string | null, https: string | null }, bypass: string, pacUrl: string }>} parsed proxy state.
+ * value table cannot read; parse the array body separately. `scutil` prints
+ * IPv6 literals bare, while URL syntax requires brackets.
+ * @param {string} text - the command output.
+ * @returns {{ enabled: boolean, servers: { http: string | null, https: string | null }, bypass: string, pacUrl: string, dormant: string | null }} parsed proxy state.
+ */
+function parseMacProxy(text) {
+  const fields = new Map()
+  for (const line of String(text).split(/\r?\n/)) {
+    const match = /^\s*([A-Za-z]+)\s*:\s*(.*)$/.exec(line)
+    if (match !== null) fields.set(match[1], match[2].trim())
+  }
+  const address = (scheme) => {
+    const host = fields.get(`${scheme}Proxy`) ?? ''
+    const port = fields.get(`${scheme}Port`) ?? ''
+    if (host === '' || port === '') return null
+    const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+    return `http://${authority}:${port}`
+  }
+  // Only a scheme whose switch is on may route traffic; a disabled scheme
+  // keeps its host/port fields populated in `scutil`.
+  const enabledAddress = (scheme) => (fields.get(`${scheme}Enable`) === '1' ? address(scheme) : null)
+  const arrayBody = /ExceptionsList\s*:\s*<array>\s*\{([\s\S]*?)\}/.exec(String(text))?.[1] ?? ''
+  const bypassEntries = arrayBody.split(/\r?\n/)
+    .map((line) => /^\s*\d+\s*:\s*(.+?)\s*$/.exec(line)?.[1])
+    .filter((entry) => typeof entry === 'string' && entry !== '')
+  if (fields.get('ExcludeSimpleHostnames') === '1') bypassEntries.push('<local>')
+  const bypass = bypassEntries.join(';')
+  const pacUrl = fields.get('ProxyAutoConfigEnable') === '1' ? (fields.get('ProxyAutoConfigURLString') ?? '') : ''
+  const http = enabledAddress('HTTP')
+  const https = enabledAddress('HTTPS')
+  return {
+    enabled: http !== null || https !== null || pacUrl !== '',
+    servers: { http, https },
+    bypass,
+    pacUrl,
+    dormant: address('HTTP') ?? address('HTTPS'),
+  }
+}
+
+/**
+ * Read the macOS system proxy through `scutil --proxy`.
+ * @returns {Promise<ReturnType<typeof parseMacProxy>>} parsed proxy state.
  */
 function readMacProxy() {
   return new Promise((resolve, reject) => {
@@ -329,37 +382,7 @@ function readMacProxy() {
         reject(error)
         return
       }
-      const text = String(stdout)
-      const fields = new Map()
-      for (const line of text.split(/\r?\n/)) {
-        const match = /^\s*([A-Za-z]+)\s*:\s*(.*)$/.exec(line)
-        if (match !== null) fields.set(match[1], match[2].trim())
-      }
-      const address = (scheme) => {
-        const host = fields.get(`${scheme}Proxy`) ?? ''
-        const port = fields.get(`${scheme}Port`) ?? ''
-        if (host === '' || port === '') return null
-        return `http://${host}:${port}`
-      }
-      // Only a scheme whose switch is on may route traffic; a disabled scheme
-      // keeps its host/port fields populated in `scutil`.
-      const enabledAddress = (scheme) => (fields.get(`${scheme}Enable`) === '1' ? address(scheme) : null)
-      const arrayBody = /ExceptionsList\s*:\s*<array>\s*\{([\s\S]*?)\}/.exec(text)?.[1] ?? ''
-      const bypassEntries = arrayBody.split(/\r?\n/)
-        .map((line) => /^\s*\d+\s*:\s*(.+?)\s*$/.exec(line)?.[1])
-        .filter((entry) => typeof entry === 'string' && entry !== '')
-      if (fields.get('ExcludeSimpleHostnames') === '1') bypassEntries.push('<local>')
-      const bypass = bypassEntries.join(';')
-      const pacUrl = fields.get('ProxyAutoConfigEnable') === '1' ? (fields.get('ProxyAutoConfigURLString') ?? '') : ''
-      const http = enabledAddress('HTTP')
-      const https = enabledAddress('HTTPS')
-      resolve({
-        enabled: http !== null || https !== null || pacUrl !== '',
-        servers: { http, https },
-        bypass,
-        pacUrl,
-        dormant: address('HTTP') ?? address('HTTPS'),
-      })
+      resolve(parseMacProxy(String(stdout)))
     })
   })
 }
@@ -435,6 +458,36 @@ function toProxyUrl(value) {
 }
 
 /**
+ * The authority of a URL exactly as it was written, without userinfo.
+ * @param {string} text - the raw URL text.
+ * @returns {string} the authority, or an empty string.
+ */
+function rawAuthority(text) {
+  const start = text.indexOf('//')
+  const rest = start === -1 ? text : text.slice(start + 2)
+  const end = rest.search(/[/?#]/)
+  const authority = end === -1 ? rest : rest.slice(0, end)
+  const at = authority.lastIndexOf('@')
+  return at === -1 ? authority : authority.slice(at + 1)
+}
+
+/**
+ * The port the text writes, even when it is the scheme's default.
+ *
+ * WHATWG parsing empties `.port` for `http://host:80`, so a typed default port
+ * is otherwise indistinguishable from no port at all — and `http://host` with
+ * no port must stay invalid.
+ * @param {string} text - the raw URL text.
+ * @returns {string | null} the port digits, or null when the authority has none.
+ */
+function explicitPort(text) {
+  const match = /^(?:\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(rawAuthority(text))
+  if (match === null) return null
+  const port = Number(match[1])
+  return port >= 1 && port <= 65535 ? String(port) : null
+}
+
+/**
  * Validate a user-supplied proxy URL.
  * @param {string} value - text from the settings field.
  * @returns {string | null} normalized URL, or null when invalid.
@@ -446,14 +499,18 @@ function normalizeCustomProxy(value) {
   try {
     const url = new URL(text)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
-    if (url.hostname === '' || url.port === '') return null
+    if (url.hostname === '') return null
+    // `url.port` is empty for the scheme's default port, so recover the digits
+    // from the text: `http://host:80` is a valid preference, `http://host` is not.
+    const port = url.port !== '' ? url.port : explicitPort(text)
+    if (port === null) return null
     if (!hasValidCredentials(url)) return null
     // `url.username`/`url.password` are already percent-encoded; re-encoding
     // them would double-encode a correctly written credential.
     const credentials = url.username === ''
       ? ''
       : `${url.username}${url.password === '' ? '' : `:${url.password}`}@`
-    return `${url.protocol}//${credentials}${url.host}`
+    return `${url.protocol}//${credentials}${url.hostname}:${port}`
   } catch { return null }
 }
 
@@ -942,7 +999,7 @@ function createDispatcher(policy, undici) {
         return new undici.ProxyAgent({ ...options, uri: proxy })
       } catch (error) {
         // A malformed proxy URI must not break every request in the process.
-        pacFailureAt = Date.now()
+        // This is not a PAC failure; the reachability probe reports it.
         log('cannot create a ProxyAgent for the selected proxy', error)
         return new undici.Pool(origin, options)
       }
@@ -1267,9 +1324,11 @@ function publicDetection(detection) {
  */
 function snapshot(detection) {
   const codes = new Set(status.codes)
-  if (pacFailureAt !== 0 && Date.now() - pacFailureAt < 60_000) codes.add('pac-failed')
-  const current = codes.size === status.codes.length ? status : { ...status, codes: [...codes] }
-  return { ok: true, settings, status: current, detection: publicDetection(detection) }
+  // A PAC failure is only meaningful while a PAC route is the active policy;
+  // it must not linger on the row after the user switches to direct/custom.
+  if (status.pac && pacFailureAt !== 0 && Date.now() - pacFailureAt < 60_000) codes.add('pac-failed')
+  const effective = codes.size === status.codes.length ? status : { ...status, codes: [...codes] }
+  return { ok: true, settings, status: effective, detection: publicDetection(detection) }
 }
 
 /**
@@ -1367,9 +1426,13 @@ export const __test = {
   bypassesProxy,
   buildPolicy,
   createPacEvaluator,
+  explicitPort,
   normalizeCustomProxy,
+  parseMacProxy,
   parseProxyServer,
+  parseRegQuery,
   policyFingerprint,
   proxyForUrl,
+  sanitizeProxy,
   toProxyUrl,
 }

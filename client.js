@@ -318,6 +318,24 @@ window.__ModuleLoader__.load({
       return translate('system.none');
     }
 
+    /** The authority of a URL as written, without userinfo. */
+    function rawAuthority(text) {
+      const start = text.indexOf('//');
+      const rest = start === -1 ? text : text.slice(start + 2);
+      const end = rest.search(/[/?#]/);
+      const authority = end === -1 ? rest : rest.slice(0, end);
+      const at = authority.lastIndexOf('@');
+      return at === -1 ? authority : authority.slice(at + 1);
+    }
+
+    /** The port the text writes, even when it is the scheme's default. */
+    function explicitPort(text) {
+      const match = /^(?:\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(rawAuthority(text));
+      if (match === null) return null;
+      const port = Number(match[1]);
+      return port >= 1 && port <= 65535 ? String(port) : null;
+    }
+
     /** Validate a typed proxy URL the same way the Host does. */
     function isProxyUrl(value) {
       const text = String(value ?? '').trim();
@@ -326,7 +344,10 @@ window.__ModuleLoader__.load({
       try {
         const url = new URL(text);
         if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-        if (url.hostname === '' || url.port === '') return false;
+        if (url.hostname === '') return false;
+        // `url.port` is empty for the scheme's default port, so recover the
+        // digits from the text; a port must still be written explicitly.
+        if (url.port === '' && explicitPort(text) === null) return false;
         // Match the Host: malformed percent escapes would make every proxied
         // request throw URIError inside undici's ProxyAgent.
         decodeURIComponent(url.username);
@@ -633,12 +654,12 @@ window.__ModuleLoader__.load({
         return () => { tag.remove(); };
       }, 'network-proxy: styles');
 
-      ctx.slots.inject('settings.general.item', () => ctx.slots.register({
+      ctx.effect(() => ctx.slots.inject('settings.general.item', () => ctx.slots.register({
         name: 'settings.general.item',
         id: 'network-proxy',
         order: 13,
         locale: NS,
-      }, NetworkProxyRow));
+      }, NetworkProxyRow)), 'network-proxy: settings row');
     }
 
     return {
