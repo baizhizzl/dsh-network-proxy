@@ -79,10 +79,17 @@ client.js           Client 半：settings.general.item 中的偏好行（中英�
 cordis.patch.yml    插入 network-proxy 插件行
 locale/{zh,en}.json 插件标题与描述（Plugin Manager 展示）
 icon.svg            插件图标
-test/host.test.mjs  Host 半验证脚本
+test/host.test.mjs  Host 半验证脚本（需要 Harness 运行时）
+test/unit.test.mjs  纯 Host 解析/匹配单元测试（普通 Node 即可）
 ```
 
 ## 本地验证
+
+纯解析与匹配逻辑（注册表输出、`scutil` 输出、URL 归一化、旁路匹配、PAC 求值）不依赖 Harness，用普通 Node 跑：
+
+```powershell
+npm test
+```
 
 Host 半的验证脚本在真实的 Harness 运行时（Electron as Node）里执行，用本地假代理验证 HTTP 转发、HTTPS CONNECT、loopback 旁路、环境变量发布、持久化与卸载恢复；配置只写临时目录。
 
@@ -98,7 +105,8 @@ $env:ELECTRON_RUN_AS_NODE = '1'
 - PAC 脚本缓存 60 秒；点“重新检测”会强制重新读取系统设置并重新下载。求值器运行在无宿主对象的 Node `vm` 上下文里（禁用字符串代码生成），但 Node 明确说明 `vm` 不是安全边界，仍不应把不可信 PAC 当作可信输入。
 - PAC 按 origin（scheme + host + port）求值，undici 的 dispatcher 工厂拿不到请求路径，所以依赖路径的 PAC 规则不会生效；目前只采用第一个 `PROXY`/`HTTPS` 项，不做多代理故障转移。
 - WPAD 自动检测（`AutoDetect=1` 且没有 PAC URL）暂不支持，会在界面上显示提示，而不是静默直连。
-- 自定义模式必须写端口；系统 `ProxyServer` 里形如 `http://user:pass@host:port` 的凭据会被保留，界面与日志只显示去掉凭据的地址。
+- 自定义模式必须写明端口；`http://host:80`、`https://host:443` 这类默认端口也算写明，但省略端口的 `http://host` 会被拒绝。系统 `ProxyServer` 里形如 `http://user:pass@host:port` 的凭据会被保留，界面与日志只显示去掉凭据的地址。
+- 跟随系统模式不会回退到启动时的 `HTTPS_PROXY` 等环境变量：系统代理没开就是直连。插件安装后会接管 Harness 原本由 `@deepseek-ai/dsh-http-proxy` 按环境变量装好的 dispatcher；如果你的代理只写在环境变量里，请改用自定义模式填写地址。
 - 旁路列表支持 IPv4/IPv6 CIDR、`<local>`、`*.example.com`、`127.*` 与端口；子进程的 `NO_PROXY` 只能表达主机/域名，无法表达整个 `127.0.0.0/8`。如果系统旁路列表是 `*`，所有请求直连，状态会显示 `bypass-all` 而不是“代理已生效”。
 - 设置写入失败时仍会生效，但状态会显示 `persist-failed`（重启后会丢失）；配置文件是明文 JSON（权限 0600）。
 - 客户端调用 Host 有 15 秒超时与“重试”按钮；自定义输入框在输入法组合状态下按 Enter 不会误保存。
