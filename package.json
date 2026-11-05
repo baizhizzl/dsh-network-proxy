@@ -18,7 +18,7 @@
     "system-proxy"
   ],
   "scripts": {
-    "test": "node --test test/unit.test.mjs"
+    "test": "node --test test/unit.test.mjs test/client.test.mjs"
   },
   "exports": {
     ".": "./index.js",

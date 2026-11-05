@@ -86,6 +86,10 @@ test('toProxyUrl normalizes without inventing credentials', () => {
   assert.equal(t.toProxyUrl('::1'), null)
   assert.equal(t.toProxyUrl('http://proxy.local'), 'http://proxy.local:80')
   assert.equal(t.toProxyUrl('socks5h://127.0.0.1:1080'), null)
+  // WinINET also stores credentials without a scheme.
+  assert.equal(t.toProxyUrl('user:pass@127.0.0.1:7890'), 'http://user:pass@127.0.0.1:7890')
+  assert.equal(t.toProxyUrl('user@127.0.0.1:7890'), 'http://user@127.0.0.1:7890')
+  assert.equal(t.toProxyUrl('user:pass@127.0.0.1'), null)
 })
 
 test('sanitizeProxy removes credentials for the status line', () => {
@@ -116,6 +120,10 @@ test('bypassesProxy honours a port on an entry', () => {
   assert.equal(t.bypassesProxy('example.com:8443', new URL('https://example.com:8443/')), true)
   assert.equal(t.bypassesProxy('example.com:8443', new URL('https://example.com/')), false)
   assert.equal(t.bypassesProxy('[fd00::1]:8080', new URL('http://[fd00::1]:8080/')), true)
+  // A bare IPv6 literal with a trailing port is split only when the head is IPv6.
+  assert.equal(t.bypassesProxy('fd00::1:8080', new URL('http://[fd00::1]:8080/')), true)
+  assert.equal(t.bypassesProxy('fd00::1:8080', new URL('http://[fd00::1]/')), false)
+  assert.equal(t.bypassesProxy('::ffff:1.2.3.4', new URL('http://[::ffff:1.2.3.4]/')), true)
 })
 
 test('bypassesProxy treats an empty list as no bypass', () => {
@@ -217,6 +225,30 @@ test('parseMacProxy reads a PAC URL and ExcludeSimpleHostnames', () => {
   assert.equal(mac.bypass, 'localhost;<local>')
 })
 
+test('system mode inherits the launch proxy only when the OS has none', () => {
+  const empty = { enabled: false, http: null, https: null, bypass: '' }
+  assert.equal(t.buildPolicy({ mode: 'system', custom: '' }, empty).kind, 'direct')
+  assert.equal(t.buildPolicy({ mode: 'system', custom: '' }, empty, true).kind, 'inherit')
+  assert.equal(t.policyFingerprint({ kind: 'inherit' }), 'inherit')
+  assert.notEqual(t.policyFingerprint({ kind: 'inherit' }), t.policyFingerprint({ kind: 'direct' }))
+})
+
+test('an OS proxy wins over the launch policy', () => {
+  const policy = t.buildPolicy(
+    { mode: 'system', custom: '' },
+    { enabled: true, http: 'http://os:1', https: 'http://os:1', bypass: '' },
+    true,
+  )
+  assert.equal(policy.kind, 'proxy')
+  assert.equal(policy.http, 'http://os:1')
+  assert.equal(policy.source, 'system')
+})
+
+test('an OS proxy naming only SOCKS still falls back to the launch policy', () => {
+  const detection = { enabled: true, http: null, https: null, bypass: '', codes: ['socks-unsupported'] }
+  assert.equal(t.buildPolicy({ mode: 'system', custom: '' }, detection, true).kind, 'inherit')
+})
+
 // ------------------------------------------------------------------- PAC eval
 
 test('PAC evaluator reads DIRECT, PROXY, HTTPS and SOCKS tokens', () => {
@@ -242,4 +274,9 @@ test('PAC evaluator contains failures and hostile scripts', () => {
     'http://127.0.0.1/escape.pac',
   )
   assert.equal(escape(new URL('https://example.com/')).failed, true)
+})
+
+test('PAC evaluator rejects an oversized script', () => {
+  const oversized = 'function FindProxyForURL() { return "DIRECT" }\n//' + 'x'.repeat(1024 * 1024)
+  assert.throws(() => t.createPacEvaluator(oversized, 'http://127.0.0.1/big.pac'), /too large/)
 })

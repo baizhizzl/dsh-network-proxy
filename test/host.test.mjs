@@ -205,6 +205,14 @@ try {
   const reapplied = await call({ action: 'set', mode: 'custom', custom: proxyUrl })
   check('re-applying the same policy keeps the dispatcher', reapplied.body.ok === true && undici.getGlobalDispatcher() === keptDispatcher)
 
+  // System mode with no usable OS proxy hands the process back to the launcher
+  // instead of forcing every request direct.
+  await helpers.installPolicy({ kind: 'inherit', noProxy: '' })
+  check('inherit restores the launch dispatcher', undici.getGlobalDispatcher() === launchDispatcher)
+  check('inherit restores the launch proxy env', process.env.HTTPS_PROXY === 'http://baseline.invalid:1', String(process.env.HTTPS_PROXY))
+  const afterInherit = await call({ action: 'set', mode: 'custom', custom: proxyUrl })
+  check('a policy after inherit swaps the dispatcher again', afterInherit.body.ok === true && undici.getGlobalDispatcher() !== launchDispatcher)
+
   const credentialUrl = `http://user:pass@127.0.0.1:${proxyPort}`
   const credentialApplied = await call({ action: 'set', mode: 'custom', custom: credentialUrl })
   check('status hides proxy credentials', credentialApplied.body.status.http === proxyUrl && credentialApplied.body.settings.custom === credentialUrl, credentialApplied.body.status.http)
